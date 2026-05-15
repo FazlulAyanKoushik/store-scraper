@@ -1,0 +1,81 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: scraper-redis
+    networks:
+      - app-net
+
+  dynamodb-local:
+    image: amazon/dynamodb-local:latest
+    container_name: dynamodb-local
+    ports:
+      - "8001:8000"
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory"]
+    networks:
+      - app-net
+
+  backend:
+    build: ./backend
+    container_name: fastapi-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DYNAMODB_ENDPOINT=http://dynamodb-local:8000
+      - AWS_DEFAULT_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=fakekey
+      - AWS_SECRET_ACCESS_KEY=fakesecret
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - dynamodb-local
+      - redis
+    networks:
+      - app-net
+    shm_size: "2gb"
+
+  celery-worker:
+    build: ./backend
+    container_name: celery-worker
+    command: celery -A celery_app worker --loglevel=info --concurrency=1
+    env_file:
+      - ./backend/.env
+    environment:
+      - DYNAMODB_ENDPOINT=http://dynamodb-local:8000
+      - AWS_DEFAULT_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=fakekey
+      - AWS_SECRET_ACCESS_KEY=fakesecret
+      - REDIS_URL=redis://redis:6379/0
+      - DEBUG_DUMP=1
+      - SCRAPER_PROXY=${SCRAPER_PROXY:-}
+      - SCRAPER_MAX_RETRIES=${SCRAPER_MAX_RETRIES:-3}
+    depends_on:
+      - redis
+      - dynamodb-local
+    networks:
+      - app-net
+    shm_size: "2gb"
+
+  dynamodb-admin:
+    image: aaronshaf/dynamodb-admin
+    container_name: dynamodb-admin
+    ports:
+      - "8005:8001"
+    environment:
+      - DYNAMO_ENDPOINT=http://dynamodb-local:8000
+    depends_on:
+      - dynamodb-local
+    networks:
+      - app-net
+
+  frontend:
+    build: ./frontend
+    container_name: react-frontend
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    networks:
+      - app-net
+
+networks:
+  app-net:
+    driver: bridge
