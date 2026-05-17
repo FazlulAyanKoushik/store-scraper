@@ -24,6 +24,7 @@ build/
 
 # Debug
 debug*.html
+debug*.txt
 /tmp/
 *.log
 
@@ -33,4 +34,3 @@ Thumbs.db
 
 # Docker
 *.pyc
-__pycache__/

@@ -47,6 +47,9 @@ services:
       - DEBUG_DUMP=1
       - SCRAPER_PROXY=${SCRAPER_PROXY:-}
       - SCRAPER_MAX_RETRIES=${SCRAPER_MAX_RETRIES:-3}
+      - BRIGHTDATA_ZONE=${BRIGHTDATA_ZONE:-}
+      - BRIGHTDATA_USERNAME=${BRIGHTDATA_USERNAME:-}
+      - BRIGHTDATA_PASSWORD=${BRIGHTDATA_PASSWORD:-}
     depends_on:
       - redis
       - dynamodb-local

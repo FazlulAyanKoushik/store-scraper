@@ -13,6 +13,23 @@ PROXY = os.getenv("SCRAPER_PROXY", "").strip()
 MAX_RETRIES = int(os.getenv("SCRAPER_MAX_RETRIES", "3"))
 TWO_CAPTCHA_API_KEY = os.getenv("TWO_CAPTCHA_API_KEY", "").strip()
 
+# Bright Data Residential Proxy
+BRIGHTDATA_ZONE = os.getenv("BRIGHTDATA_ZONE", "").strip()
+BRIGHTDATA_USERNAME = os.getenv("BRIGHTDATA_USERNAME", "").strip()
+BRIGHTDATA_PASSWORD = os.getenv("BRIGHTDATA_PASSWORD", "").strip()
+
+
+def get_proxy_url():
+    """Build proxy URL from Bright Data credentials or manual proxy."""
+    import urllib.parse
+    if BRIGHTDATA_ZONE and BRIGHTDATA_USERNAME and BRIGHTDATA_PASSWORD:
+        # URL encode the password to handle special characters like #
+        encoded_password = urllib.parse.quote(BRIGHTDATA_PASSWORD, safe='')
+        return f"http://{BRIGHTDATA_USERNAME}-{BRIGHTDATA_ZONE}:{encoded_password}@brd.superproxy.io:33335"
+    elif PROXY:
+        return PROXY
+    return ""
+
 
 def solve_recaptcha(driver, log_callback, max_wait=120):
     """Solve reCAPTCHA using 2Captcha service."""
@@ -81,11 +98,24 @@ def solve_recaptcha(driver, log_callback, max_wait=120):
                     captcha_solution = poll_result.get("request")
                     log_callback("reCAPTCHA solved! Submitting token...")
 
-                    # Execute JavaScript to set the token
+                    # Try multiple methods to set the token
+                    try:
+                        # Method 1: Set value on textarea
+                        textarea = driver.find_element(By.CSS_SELECTOR, "textarea[name='g-recaptcha-response']")
+                        driver.execute_script("arguments[0].style.display = 'block';", textarea)
+                        driver.execute_script(f"arguments[0].value = '{captcha_solution}';", textarea)
+                        driver.execute_script("arguments[0].dispatchEvent(new Event('input', {{ bubbles: true }}));", textarea)
+                        driver.execute_script("arguments[0].dispatchEvent(new Event('change', {{ bubbles: true }}));", textarea)
+                    except Exception as e:
+                        log_callback(f"Token injection method 1 failed: {e}")
+
+                    # Method 2: Also try setting via innerHTML on any element with that name
                     driver.execute_script(f'''
-                        document.querySelector('[name="g-recaptcha-response"]').innerHTML = "{captcha_solution}";
+                        var el = document.querySelector('[name="g-recaptcha-response"]');
+                        if (el) {{ el.innerHTML = "{captcha_solution}"; }}
                     ''')
-                    time.sleep(1)
+
+                    time.sleep(2)
                     return captcha_solution
                 elif poll_result.get("request") == "CAPCHA_NOT_READY":
                     log_callback(f"Still waiting... ({i+1}/{max_wait//5})")
@@ -147,8 +177,11 @@ def get_driver():
     ua = random.choice(user_agents)
     options.add_argument(f"--user-agent={ua}")
 
-    if PROXY:
-        options.add_argument(f"--proxy-server={PROXY}")
+    # Use Bright Data or manual proxy
+    proxy_url = get_proxy_url()
+    if proxy_url:
+        log_callback(f"Using proxy: {proxy_url.split('@')[0]}@***")  # Hide password in log
+        options.add_argument(f"--proxy-server={proxy_url}")
 
     options.binary_location = "/usr/bin/chromium"
 
@@ -371,7 +404,8 @@ def _scrape_attempt(store_name: str, log_callback) -> tuple[dict, object]:
 
     try:
         encoded_query = urllib.parse.quote(store_name)
-        url = f"https://www.google.co.jp/search?q={encoded_query}&hl=ja&gl=jp"
+        # Add extra params to reduce reCAPTCHA likelihood
+        url = f"https://www.google.co.jp/search?q={encoded_query}&hl=ja&gl=jp&tbs=isz:l"
         log_callback(f"Navigating to Google search for '{store_name}'...")
 
         driver.get(url)
@@ -403,19 +437,35 @@ def _scrape_attempt(store_name: str, log_callback) -> tuple[dict, object]:
                 log_callback("Attempting to solve reCAPTCHA with 2Captcha...")
                 token = solve_recaptcha(driver, log_callback)
                 if token:
-                    log_callback("reCAPTCHA solved! Refreshing page...")
+                    log_callback("reCAPTCHA solved! Navigating to fresh URL...")
                     time.sleep(2)
-                    driver.refresh()
-                    time.sleep(random.uniform(3, 5))
+
+                    # Navigate to a fresh URL instead of just refreshing
+                    # This helps clear any cached session issues
+                    encoded_query = urllib.parse.quote(store_name)
+                    new_url = f"https://www.google.co.jp/search?q={encoded_query}&hl=ja&gl=jp&tbs=isz:l"
+                    driver.get(new_url)
+                    time.sleep(random.uniform(4, 7))
 
                     # Check if page loaded successfully after solve
                     new_page_source = driver.page_source.lower()
-                    if "recaptcha" not in new_page_source:
+                    if "recaptcha" not in new_page_source and "unusual traffic" not in new_page_source:
                         log_callback("reCAPTCHA bypassed successfully!")
                         result.pop("_recaptcha", None)
                         # Continue with scraping
                     else:
-                        log_callback("reCAPTCHA still present after solve.")
+                        log_callback("reCAPTCHA still present after solve - trying to find and click submit if exists")
+
+                        # Try to find and click any submit button in the form
+                        try:
+                            submit_buttons = driver.find_elements(By.XPATH, "//button[contains(@type, 'submit')]")
+                            for btn in submit_buttons:
+                                if btn.is_displayed():
+                                    btn.click()
+                                    time.sleep(3)
+                                    break
+                        except Exception as e:
+                            log_callback(f"Could not find submit button: {e}")
                 else:
                     log_callback("Failed to solve reCAPTCHA.")
             else:
