@@ -13,7 +13,7 @@ dist/
 build/
 
 # Environment
-.env
+backend/.env
 .env.local
 
 # IDE

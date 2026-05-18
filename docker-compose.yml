@@ -33,6 +33,7 @@ services:
     shm_size: "2gb"
     volumes:
       - ./backend:/app
+      - ./debug_output:/tmp/debug_output
 
   celery-worker:
     build: ./backend
@@ -60,6 +61,7 @@ services:
     shm_size: "2gb"
     volumes:
       - ./backend:/app
+      - ./debug_output:/tmp/debug_output
 
   dynamodb-admin:
     image: aaronshaf/dynamodb-admin

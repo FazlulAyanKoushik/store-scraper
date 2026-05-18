@@ -163,6 +163,10 @@ def get_driver():
     options = uc.ChromeOptions()
     if SCRAPER_HEADLESS:
         options.add_argument("--headless=new")
+    else:
+        # Options for headed mode in Docker (requires Xvfb or similar)
+        options.add_argument("--remote-debugging-port=9222")
+        options.add_argument("--disable-setuid-sandbox")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
@@ -238,14 +242,23 @@ def get_driver():
 def save_debug(driver, label):
     if not DEBUG_DUMP:
         return
+    
+    debug_dir = "/tmp/debug_output"
+    if not os.path.exists(debug_dir):
+        try:
+            os.makedirs(debug_dir, exist_ok=True)
+        except Exception as e:
+            print(f"[DEBUG] Failed to create debug directory {debug_dir}: {e}")
+            debug_dir = "/tmp"
+
     timestamp = int(time.time())
-    html_path = f"/tmp/debug_{label}_{timestamp}.html"
+    html_path = f"{debug_dir}/debug_{label}_{timestamp}.html"
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(driver.page_source)
     print(f"[DEBUG] Page source saved to {html_path}")
     
     try:
-        png_path = f"/tmp/debug_{label}_{timestamp}.png"
+        png_path = f"{debug_dir}/debug_{label}_{timestamp}.png"
         driver.save_screenshot(png_path)
         print(f"[DEBUG] Screenshot saved to {png_path}")
     except Exception as e:
@@ -255,6 +268,10 @@ def save_debug(driver, label):
 def has_product_section(driver, log_callback=None):
     """Check if the page has a product catalog section (not just posts/services)."""
     indicators = [
+        # From debug.txt - GdmDKe is the container for show all button that leads to products
+        "//div[contains(@class, 'GdmDKe')]",
+        "//div[contains(@class, 'GdmDKe')]//a[contains(text(), 'すべて表示')]",
+        # Products overview for desktop
         "//*[@data-attrid='kc:/local:products_overview_for_desktop']",
         "//*[@data-attrid='kc:/local:product catalog']",
         "//*[@data-attrid='kc:/local:products']",
@@ -267,72 +284,122 @@ def has_product_section(driver, log_callback=None):
         "//*[@data-product-to-scroll]",
         "//a[contains(@data-href, '/local/place/products/product')]",
         "//div[contains(@class, 't3RpAe')]",
+        # Service catalog indicators - might lead to products too
+        "//div[contains(@class, 'r6BRBd')]//div[contains(@class, 'hvddEd')]",
+        "//div[contains(@class, 'sB1Bee')]",
     ]
     for xpath in indicators:
         elements = driver.find_elements(By.XPATH, xpath)
         if elements:
+            # Check if it's explicitly products or just services
+            found_products = False
+            for el in elements:
+                try:
+                    text = el.text.strip().lower()
+                    if "商品" in text or "product" in text:
+                        found_products = True
+                        break
+                except: continue
+            
             if log_callback:
-                log_callback(f"Product section indicator matched: {xpath}")
+                log_callback(f"Product section indicator matched: {xpath} (found {len(elements)} elements, product_specific={found_products})")
             return True
 
-    # Fallback: look for elements containing "商品" (products) text
-    product_text_elements = driver.find_elements(By.XPATH, "//span[contains(., '商品')]")
+    # Fallback: look for elements containing "商品" (products) or "すべて表示" text
+    product_text_elements = driver.find_elements(By.XPATH, "//*[contains(text(), '商品')]")
     if product_text_elements:
         for el in product_text_elements:
-            text = el.text.strip()
-            if text and len(text) < 50:  # Skip long paragraphs
-                if log_callback:
-                    log_callback(f"Product section fallback text matched: '{text}'")
-                return True
+            try:
+                text = el.text.strip()
+                if text and len(text) < 50:
+                    if log_callback:
+                        log_callback(f"Product section fallback text matched: '{text}'")
+                    return True
+            except: continue
+    
+    # Also check for "すべて表示" anywhere on page - it's a strong indicator
+    show_all_elements = driver.find_elements(By.XPATH, "//*[contains(text(), 'すべて表示')]")
+    if show_all_elements:
+        if log_callback:
+            log_callback(f"Found 'すべて表示' button - product/service section exists")
+        return True
+        
     return False
 
 
 def find_product_show_all(driver, log_callback=None):
     """Find 'Show all' button specifically inside a product section."""
-    # First look for product-scoped show-all
-    product_scope = [
-        "//*[@data-attrid='kc:/local:products_overview_for_desktop']//*[text()='すべて表示']",
-        "//*[@data-attrid='kc:/local:products_overview_for_desktop']//*[contains(text(), 'すべて')]",
-        "//*[@data-attrid='kc:/local:product catalog']//*[text()='すべて表示']",
-        "//*[@data-attrid='kc:/local:product catalog']//*[contains(text(), 'すべて')]",
-        "//*[contains(@data-attrid, 'products_overview')]//*[text()='すべて表示']",
-        "//*[contains(@data-attrid, 'products_overview')]//*[contains(text(), 'すべて')]",
-        "//*[contains(@data-attrid, 'product')]//*[text()='すべて表示']",
-        "//*[contains(@data-attrid, 'product')]//*[contains(text(), 'すべて')]",
-        "//div[contains(@class, 'BFOCWc')]/ancestor::*[@data-hveid]//*[contains(text(), 'すべて')]",
-        "//a[contains(text(), 'すべて表示') and ancestor::*[.//a[contains(@data-href, '/local/place/products/product')]]]",
-        "//a[contains(text(), 'すべて表示') and ancestor::*[.//*[contains(@class, 'prDW') or contains(@class, 't3RpAe')]]]",
+    # Priority 0: Explicitly under "商品" or "工事メニュー" headings (from gbp_construction_service.py)
+    heading_based = [
+        "//*[contains(text(), '商品') or contains(text(), '工事メニュー')]/ancestor::*[contains(@data-hveid)]//a[contains(text(), 'すべて表示')]",
+        "//*[contains(text(), '商品') or contains(text(), '工事メニュー')]/following::a[contains(text(), 'すべて表示')][position()=1]",
     ]
-    for xpath in product_scope:
-        try:
-            btn = driver.find_element(By.XPATH, xpath)
-            if btn and btn.is_displayed():
-                if log_callback:
-                    log_callback(f"Found 'Show all' button via scoped match: {xpath}")
-                return btn, f"product-section: {xpath[:60]}"
-        except Exception:
-            continue
 
-    # Broader: any show-all that is near product-related content
-    general = [
-        ("//*[text()='すべての商品を表示']", "exact 'すべての商品を表示'"),
-        ("//*[contains(text(), 'すべての商品')]", "contains 'すべての商品'"),
-        ("//*[text()='すべて表示'][ancestor::div[contains(., '商品')]]", "すべて表示 near 商品 text"),
-        ("//*[@aria-label='すべて表示'][contains(@href, 'product')]", "aria-label + product href"),
-        ("//a[contains(@href, 'products')][contains(text(), 'すべて')]", "href products + すべて"),
-        ("//a[contains(@href, 'lpc')][contains(text(), 'すべて')]", "href lpc + すべて"),
-        ("//a[contains(text(), 'すべて表示')]", "any a tag with すべて表示"),
-        ("//*[contains(text(), 'すべて表示')]", "any element with すべて表示"),
+    # Priority 1: Specifically labeled as product-related 'Show all'
+    product_specific = [
+        "//a[contains(text(), 'すべての商品を表示')]",
+        "//a[contains(text(), 'すべての商品')]",
+        "//div[contains(@class, 'GdmDKe')]//a[contains(., '商品') and contains(., 'すべて')]",
+        "//a[contains(@href, '/lpc/') and contains(text(), 'すべて')]",
+        "//a[contains(@href, 'product') and contains(text(), 'すべて')]",
     ]
-    for xpath, desc in general:
-        try:
-            btn = driver.find_element(By.XPATH, xpath)
-            if btn and btn.is_displayed():
-                if log_callback:
-                    log_callback(f"Found 'Show all' button via broader match: {desc} ({xpath})")
-                return btn, desc
-        except Exception:
-            continue
+    
+    # Priority 2: 'Show all' near '商品' text
+    near_product_text = [
+        "//a[contains(text(), 'すべて表示') and ancestor::div[contains(., '商品')]]",
+        "//a[contains(text(), 'すべて表示') and (preceding::*[contains(text(), '商品')][position() < 5] or following::*[contains(text(), '商品')][position() < 5])]",
+    ]
+
+    # Priority 3: The GdmDKe container mentioned in debug.txt
+    gdm_selectors = [
+        "//div[contains(@class, 'GdmDKe')]//a[contains(text(), 'すべて表示')]",
+        "//div[contains(@class, 'GdmDKe')]//a[contains(@class, 'FOfI3')]",
+    ]
+
+    # Priority 4: Knowledge Panel section specific
+    kp_selectors = [
+        "//*[@data-attrid='kc:/local:products_overview_for_desktop']//*[contains(text(), 'すべて')]",
+        "//*[@data-attrid='kc:/local:product catalog']//*[contains(text(), 'すべて')]",
+        "//*[contains(@data-attrid, 'product')]//*[contains(text(), 'すべて')]",
+    ]
+
+    # Priority 5: General 'Show all' buttons but EXCLUDING those in category/service sections if possible
+    general = [
+        "//a[contains(text(), 'すべて表示') and not(ancestor::*[contains(., 'カテゴリ')])]",
+        "//a[contains(text(), 'すべて表示')]",
+        "//*[contains(text(), 'すべて表示') and (self::a or self::span)]",
+    ]
+
+    all_strategies = [
+        (heading_based, "Heading-based match"),
+        (product_specific, "Product-specific labels"),
+        (near_product_text, "Near '商品' text"),
+        (gdm_selectors, "GdmDKe container"),
+        (kp_selectors, "KP section"),
+        (general, "General show-all")
+    ]
+
+    for strategy_selectors, strategy_name in all_strategies:
+        for xpath in strategy_selectors:
+            try:
+                elements = driver.find_elements(By.XPATH, xpath)
+                for btn in elements:
+                    if btn and btn.is_displayed():
+                        # Extra check: if it's inside a 'カテゴリを探索' section, skip it in early strategies
+                        if strategy_name != "General show-all":
+                            try:
+                                parent_text = driver.execute_script("return arguments[0].parentElement.innerText;", btn)
+                                if "カテゴリ" in parent_text or "サービス" in parent_text:
+                                    if log_callback:
+                                        log_callback(f"[DEBUG] Skipping button in {strategy_name} because it seems category-related: '{parent_text[:30]}...'")
+                                    continue
+                            except: pass
+                            
+                        if log_callback:
+                            log_callback(f"Found 'Show all' button via {strategy_name}: {xpath}")
+                        return btn, f"{strategy_name}: {xpath[:60]}"
+            except Exception:
+                continue
 
     return None, None
 
@@ -346,11 +413,13 @@ def handle_local_pack(driver, store_name, log_callback):
         
     log_callback(f"Local pack detected with {len(pack_items)} items. Looking for matching business...")
     
+    matched = False
     for item in pack_items:
         try:
             text = item.text.strip()
             if text and store_name in text:
                 log_callback(f"Found matching business in local pack: '{text}'. Preparing to open its Knowledge Panel...")
+                matched = True
                 log_callback(f"Scrolling matching business '{text}' into view...")
                 driver.execute_script("arguments[0].scrollIntoView(true);", item)
                 time.sleep(1)
@@ -358,24 +427,62 @@ def handle_local_pack(driver, store_name, log_callback):
                 log_callback(f"Clicking on business '{text}' in local pack...")
                 driver.execute_script("arguments[0].click();", item)
                 
-                log_callback("Waiting for the Knowledge Panel content to load...")
-                time.sleep(random.uniform(4, 6))
+                log_callback("Waiting for navigation to Knowledge Panel...")
+                time.sleep(random.uniform(5, 8))
                 
-                log_callback("Scrolling page down to trigger lazy loading of product/service catalog carousels...")
-                driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
-                time.sleep(1.5)
+                # Aggressive scrolling to trigger all lazy-loaded content
+                for scroll_pos in [300, 500, 800, 1000, 1500]:
+                    driver.execute_script(f"window.scrollTo(0, {scroll_pos});")
+                    time.sleep(0.8)
+                
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(2)
+                time.sleep(3)
+                
+                # Scroll back up to top
+                driver.execute_script("window.scrollTo(0, 0);")
+                time.sleep(1)
                 
                 log_callback(f"Checking if '{text}' has a Product Catalog section...")
                 if has_product_section(driver, log_callback):
                     log_callback("Product section successfully found and validated for this business!")
                     return True
                 else:
-                    log_callback("No product section found for this business. Trying next match if any...")
+                    log_callback("No product section found. Refreshing page and trying direct search instead...")
+                    # If no product section found, try refreshing and checking again
+                    driver.refresh()
+                    time.sleep(random.uniform(4, 6))
+                    
+                    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    time.sleep(2)
+                    
+                    if has_product_section(driver, log_callback):
+                        log_callback("Product section found after refresh!")
+                        return True
+                    
+                    log_callback("Still no product section. Trying next match if any...")
         except Exception as e:
             log_callback(f"Error handling local pack item: {e}")
             continue
+    
+    if not matched:
+        log_callback("No exact match found in local pack. Trying direct search URL...")
+        # Try clicking first item if no match
+        try:
+            first_item = pack_items[0]
+            driver.execute_script("arguments[0].scrollIntoView(true);", first_item)
+            time.sleep(0.5)
+            driver.execute_script("arguments[0].click();", first_item)
+            log_callback("Clicked first item in local pack, waiting for load...")
+            time.sleep(random.uniform(5, 7))
+            
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(2)
+            
+            if has_product_section(driver, log_callback):
+                log_callback("Product section found after clicking first item!")
+                return True
+        except Exception as e:
+            log_callback(f"Error clicking first item: {e}")
             
     log_callback("Finished checking local pack items.")
     return False
@@ -383,60 +490,165 @@ def handle_local_pack(driver, store_name, log_callback):
 
 def extract_product_names(driver, log_callback=None):
     """Extract product names from the currently visible page/modal."""
-    strategies = [
-        # Products overview for desktop (current Google structure)
-        "//*[@data-attrid='kc:/local:products_overview_for_desktop']//a",
-        "//*[@data-attrid='kc:/local:products_overview_for_desktop']//span",
-        "//*[@data-attrid='kc:/local:products_overview_for_desktop']//div[contains(@class, 'Gik6Zd')]",
+    # Filter out button text and headers - these are not products
+    excluded_texts = {
+        "すべて表示", "すべて", "商品", "サービス", "products", "services", 
+        "Show all", "Show more", "もっと見る", "商品情報", "メニュー", "Product Info",
+        "カテゴリを探索", "カテゴリ", "カテゴリを表示", "サービスを表示", "工事メニュー",
+        # Known category headers observed in captures
+        "施工・工事", "調査", "ご相談"
+    }
+    
+    seen = set()
+    product_names = []
+
+    def add_if_valid(text, source_label=""):
+        if not text:
+            return
+        # Clean text
+        text = text.split('\n')[0].strip()
+        # Some items might have prices or other info in sub-elements if we select a container
+        # but text.split('\n')[0] usually gets the title.
+        if text and text not in excluded_texts and text not in seen:
+            # Avoid single words that look like labels unless they are likely products
+            if len(text) < 2:
+                return
+            seen.add(text)
+            product_names.append(text)
+            if log_callback:
+                log_callback(f"Extracted from {source_label}: '{text}'")
+
+    if log_callback:
+        log_callback("[DEBUG] Looking for product modal elements...")
+    
+    # Priority 1: Specific modal classes identified in category_wise_div.html
+    # Check for categories first (f8twAd)
+    categories = driver.find_elements(By.XPATH, "//div[contains(@class, 'f8twAd')]")
+    if categories:
+        if log_callback:
+            log_callback(f"[DEBUG] Found {len(categories)} category containers (f8twAd)")
+        
+        for cat_index, cat in enumerate(categories):
+            try:
+                # Try to get category name for logging
+                cat_name_el = cat.find_elements(By.XPATH, ".//div[contains(@class, 'EJHGm')]")
+                cat_name = cat_name_el[0].text.strip() if cat_name_el else f"Category {cat_index}"
+                if log_callback:
+                    log_callback(f"[DEBUG] Processing category: {cat_name}")
+
+                # Handle "Show more" (もっと見る) within the category
+                try:
+                    show_more_btns = cat.find_elements(By.XPATH, ".//*[contains(text(), 'もっと見る')]")
+                    for btn in show_more_btns:
+                        if btn.is_displayed():
+                            if log_callback:
+                                log_callback(f"[DEBUG] Clicking 'Show more' in category {cat_name}")
+                            driver.execute_script("arguments[0].click();", btn)
+                            time.sleep(random.uniform(1.0, 2.0))
+                except Exception as e:
+                    if log_callback:
+                        log_callback(f"[DEBUG] Error clicking 'Show more' in {cat_name}: {e}")
+
+                # Extract products within this category
+                # Structure: f8twAd > ... > J8zyUd > a.pooVf > div.su7Prc > div.t3RpAe
+                product_elements = cat.find_elements(By.XPATH, ".//div[contains(@class, 'J8zyUd')]//div[contains(@class, 't3RpAe')]")
+                
+                if not product_elements:
+                    # Fallback to any text inside J8zyUd
+                    product_elements = cat.find_elements(By.XPATH, ".//div[contains(@class, 'J8zyUd')]")
+                
+                if log_callback:
+                    log_callback(f"[DEBUG] Found {len(product_elements)} potential product elements in category {cat_name}")
+                
+                for prod in product_elements:
+                    add_if_valid(prod.text, f"category:{cat_name}")
+                    
+            except Exception as e:
+                if log_callback:
+                    log_callback(f"[DEBUG] Error processing category {cat_index}: {e}")
+
+        if product_names:
+            if log_callback:
+                log_callback(f"[DEBUG] Successfully extracted {len(product_names)} products from categories.")
+            return product_names
+
+    # If no categories found, or no products in categories, fall back to global selectors
+    selectors = [
+        "//div[contains(@class, 'su7Prc')]//div[contains(@class, 't3RpAe')]",
+        "//a[contains(@class, 'pooVf')]//div[contains(@class, 't3RpAe')]",
+        "//div[contains(@class, 'ZPm4jb')]//div[contains(@class, 't3RpAe')]",
+        "//div[@role='dialog']//div[contains(@class, 't3RpAe')]",
+        "//*[contains(@class, 'J8zyUd')]//div[contains(@class, 't3RpAe')]",
+        "//div[contains(@class, 'su7Prc')]",
+        "//a[contains(@class, 'pooVf')]",
+        "//div[contains(@class, 't3RpAe')]",
+    ]
+    
+    for selector in selectors:
+        elements = driver.find_elements(By.XPATH, selector)
+        if elements:
+            if log_callback:
+                log_callback(f"[DEBUG] Found {len(elements)} elements with {selector}")
+            for el in elements:
+                try:
+                    add_if_valid(el.text, selector)
+                except: continue
+            if product_names:
+                return product_names
+
+    # Priority 2: Knowledge Panel / Desktop Overview
+    kp_selectors = [
         "//*[@data-attrid='kc:/local:products_overview_for_desktop']//span[contains(@class, 'OSrXXb')]",
-        # Explicit data attribute for products
-        "//*[@data-product-to-scroll]",
-        # Product catalog section items
-        "//div[@data-attrid='kc:/local:product catalog']//a",
-        "//div[@data-attrid='kc:/local:product catalog']//span",
-        "//*[contains(@data-attrid, 'products_overview')]//div[contains(@class, 'Gik6Zd')]",
+        "//*[@data-attrid='kc:/local:product catalog']//span",
         "//*[contains(@data-attrid, 'products_overview')]//span[contains(@class, 'OSrXXb')]",
-        # Product names in carousel restricted
-        "//*[contains(@data-attrid, 'product')]//div[contains(@class, 'Gik6Zd')]",
         "//*[contains(@data-attrid, 'product')]//span[contains(@class, 'OSrXXb')]",
         "//g-scrolling-carousel//span[contains(@class, 'OSrXXb')]",
-        "//div[@role='dialog']//span[contains(@class, 'OSrXXb')]",
-        "//div[@role='dialog']//div[contains(@class, 'Gik6Zd')]",
-        # Product cards restricted
-        "//*[contains(@data-attrid, 'product')]//div[contains(@class, 'BFOCWc')]//span",
-        "//div[@role='dialog']//div[contains(@class, 'BFOCWc')]//span",
-        # Side panel / lpc (local product catalog)
-        "//div[contains(@class, 'lpc')]//span",
-        "//div[contains(@id, 'lpc')]//span",
-        # Generic product elements in dialog or carousel
-        "//g-scrolling-carousel//span[string-length(normalize-space())>1]",
-        "//div[@role='dialog']//span[string-length(normalize-space())>1]",
-        # Direct product classes based on observation
-        "//div[contains(@class, 't3RpAe')]",
-        "//a[contains(@data-href, '/local/place/products/product')]//div[contains(@class, 't3RpAe')]",
-        "//div[contains(@class, 'su7Prc')]//div[contains(@class, 't3RpAe')]",
+        "//div[contains(@class, 'lpc')]//span"
     ]
-    seen = set()
-    for selector in strategies:
-        items = driver.find_elements(By.XPATH, selector)
-        if items and log_callback:
-            log_callback(f"Checking xpath strategy '{selector}' - found {len(items)} elements...")
-        for item in items:
-            text = item.text.strip()
-            if text:
-                text = text.split('\n')[0].strip()
-            if text and text not in seen:
-                seen.add(text)
-                if log_callback:
-                    log_callback(f"Successfully extracted product name: '{text}'")
-        if seen:
-            return list(seen)
+    
+    for selector in kp_selectors:
+        elements = driver.find_elements(By.XPATH, selector)
+        if elements:
+            log_callback(f"[DEBUG] Found {len(elements)} elements with KP selector {selector}")
+            for el in elements:
+                try:
+                    add_if_valid(el.text, "KP")
+                except: continue
+            if product_names:
+                return product_names
+
     return []
 
 
 def extract_service_names(driver, log_callback=None):
     """Extract service/category names for service businesses."""
+    # If we are here, it's usually because extract_product_names returned nothing
+    # or we want to find top-level categories if they are all that's shown.
+    
+    # Check for the category divs we saw in category_wise_div.html (f8twAd)
+    categories = driver.find_elements(By.XPATH, "//div[contains(@class, 'f8twAd')]//div[contains(@class, 'EJHGm')]")
+    if categories:
+        seen = set()
+        names = []
+        for cat in categories:
+            text = cat.text.strip()
+            if text and text not in seen:
+                seen.add(text)
+                names.append(text)
+                if log_callback:
+                    log_callback(f"Extracted category name from f8twAd: '{text}'")
+        if names:
+            return names
+
     strategies = [
+        # Service catalog - dialog/modal - HIGHEST PRIORITY
+        "//div[@role='dialog']//div[contains(@class, 'sB1Bee')]",
+        "//div[@role='dialog']//div[contains(@class, ' EJHGm')]",
+        "//div[@role='dialog']//div[contains(@class, 't3RpAe')]",
+        "//div[@role='dialog']//div[contains(@class, 'su7Prc')]//div",
+        # Service category sections
+        "//div[contains(@class, 'r6BRBd')]//div[contains(@class, 'hvddEd')]//div[contains(@class, 'sB1Bee')]",
+        # Standard service catalog selectors
         "//div[contains(@class, 'sB1Bee')]",
         "//div[@data-attrid='kc:/local:service catalog']//span",
         "//div[@data-attrid='kc:/local:service']//a",
@@ -471,8 +683,8 @@ def _scrape_attempt(store_name: str, log_callback) -> tuple[dict, object]:
 
     try:
         encoded_query = urllib.parse.quote(store_name)
-        # Add extra params to reduce reCAPTCHA likelihood
-        url = f"https://www.google.co.jp/search?q={encoded_query}&hl=ja&gl=jp&tbs=isz:l"
+        # Use google.com with Japanese locale (works based on debug.txt)
+        url = f"https://www.google.com/search?q={encoded_query}&hl=ja"
         log_callback(f"Navigating to Google search for '{store_name}'...")
 
         driver.get(url)
@@ -593,7 +805,39 @@ def _scrape_attempt(store_name: str, log_callback) -> tuple[dict, object]:
                     log_callback("JavaScript click executed.")
 
                 log_callback("Waiting for product modal/section to load dynamically...")
-                time.sleep(random.uniform(3, 5))
+                time.sleep(random.uniform(4, 6))
+                
+                # Force scroll to make modal visible and trigger render
+                driver.execute_script("window.scrollTo(0, 200);")
+                time.sleep(1)
+                
+                # Additional wait for modal content to fully render
+                driver.execute_script("window.scrollTo(0, 400);")
+                time.sleep(2)
+                
+                # Debug: log page source length to check if modal is loaded
+                page_html = driver.page_source
+                log_callback(f"DEBUG: Page HTML length: {len(page_html)} chars")
+                
+                # Check for modal indicators
+                has_zpm4jb = "ZPm4jb" in page_html
+                has_su7prc = "su7Prc" in page_html
+                log_callback(f"DEBUG: Has ZPm4jb in page: {has_zpm4jb}")
+                log_callback(f"DEBUG: Has su7Prc in page: {has_su7prc}")
+                
+                # Scroll to make dialog visible in viewport
+                driver.execute_script("window.scrollTo(0, 300);")
+                time.sleep(1)
+                
+                # Wait for dialog/modal to appear
+                try:
+                    WebDriverWait(driver, 5).until(
+                        EC.presence_of_element_located((By.XPATH, "//div[@role='dialog']"))
+                    )
+                    log_callback("Dialog/modal detected in DOM.")
+                except Exception:
+                    log_callback("No dialog role found, proceeding with extraction.")
+                
                 save_debug(driver, "after_showall_click")
 
             log_callback("Extracting product names after clicking 'Show all'...")
@@ -607,9 +851,23 @@ def _scrape_attempt(store_name: str, log_callback) -> tuple[dict, object]:
                 result["products"] = all_products
                 result["product_count"] = len(all_products)
                 log_callback(f"Done. Product count: {result['product_count']}")
+                
+                # Check if this was likely categorized
+                has_categories = "f8twAd" in driver.page_source
+                if has_categories:
+                    log_callback(f"[DEBUG] Extracted {len(all_products)} products from a categorized view.")
+                
                 return result, driver
 
+            # Debug: save page source when no products found
+            log_callback("DEBUG: No products extracted. Saving page for analysis...")
             save_debug(driver, "no_products_found")
+            
+            # Also try to get all elements with t3RpAe class anywhere on page
+            all_t3rpae = driver.find_elements(By.XPATH, "//*[contains(@class, 't3RpAe')]")
+            log_callback(f"DEBUG: Found {len(all_t3rpae)} elements with class 't3RpAe' anywhere on page")
+            for i, el in enumerate(all_t3rpae[:5]):  # Show first 5
+                log_callback(f"  DEBUG t3RpAe[{i}]: '{el.text.strip()}'")
             log_callback("No products extracted — checking for services fallback...")
 
         log_callback("Checking for service/category names as fallback...")
