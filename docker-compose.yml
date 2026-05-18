@@ -31,6 +31,8 @@ services:
     networks:
       - app-net
     shm_size: "2gb"
+    volumes:
+      - ./backend:/app
 
   celery-worker:
     build: ./backend
@@ -56,6 +58,8 @@ services:
     networks:
       - app-net
     shm_size: "2gb"
+    volumes:
+      - ./backend:/app
 
   dynamodb-admin:
     image: aaronshaf/dynamodb-admin

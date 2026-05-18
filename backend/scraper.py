@@ -9,6 +9,7 @@ from selenium.webdriver.support import expected_conditions as EC
 
 
 DEBUG_DUMP = os.getenv("DEBUG_DUMP", "").lower() in ("1", "true", "yes")
+SCRAPER_HEADLESS = os.getenv("SCRAPER_HEADLESS", "true").lower() in ("1", "true", "yes")
 PROXY = os.getenv("SCRAPER_PROXY", "").strip()
 MAX_RETRIES = int(os.getenv("SCRAPER_MAX_RETRIES", "3"))
 TWO_CAPTCHA_API_KEY = os.getenv("TWO_CAPTCHA_API_KEY", "").strip()
@@ -48,10 +49,12 @@ def solve_recaptcha(driver, log_callback, max_wait=120):
                 break
 
         # Also try to find sitekey from data-sitekey attribute
-        if not sitekey:
-            sitekey_elem = driver.find_elements(By.XPATH, "//div[@class='g-recaptcha']")
-            if sitekey_elem:
+        data_s = None
+        sitekey_elem = driver.find_elements(By.XPATH, "//div[@class='g-recaptcha']")
+        if sitekey_elem:
+            if not sitekey:
                 sitekey = sitekey_elem[0].get_attribute("data-sitekey")
+            data_s = sitekey_elem[0].get_attribute("data-s")
 
         if not sitekey:
             log_callback("Could not find reCAPTCHA sitekey.")
@@ -67,8 +70,12 @@ def solve_recaptcha(driver, log_callback, max_wait=120):
             "method": "userrecaptcha",
             "googlekey": sitekey,
             "pageurl": driver.current_url,
-            "json": 1
+            "json": 1,
+            "enterprise": 1
         }
+        if data_s:
+            submit_data["data-s"] = data_s
+            log_callback(f"Found and including data-s: {data_s[:20]}...")
 
         resp = requests.post(submit_url, data=submit_data, timeout=30)
         result = resp.json()
@@ -104,8 +111,8 @@ def solve_recaptcha(driver, log_callback, max_wait=120):
                         textarea = driver.find_element(By.CSS_SELECTOR, "textarea[name='g-recaptcha-response']")
                         driver.execute_script("arguments[0].style.display = 'block';", textarea)
                         driver.execute_script(f"arguments[0].value = '{captcha_solution}';", textarea)
-                        driver.execute_script("arguments[0].dispatchEvent(new Event('input', {{ bubbles: true }}));", textarea)
-                        driver.execute_script("arguments[0].dispatchEvent(new Event('change', {{ bubbles: true }}));", textarea)
+                        driver.execute_script("arguments[0].dispatchEvent(new Event('input', { bubbles: true }));", textarea)
+                        driver.execute_script("arguments[0].dispatchEvent(new Event('change', { bubbles: true }));", textarea)
                     except Exception as e:
                         log_callback(f"Token injection method 1 failed: {e}")
 
@@ -115,7 +122,24 @@ def solve_recaptcha(driver, log_callback, max_wait=120):
                         if (el) {{ el.innerHTML = "{captcha_solution}"; }}
                     ''')
 
-                    time.sleep(2)
+                    # Submit the captcha form
+                    try:
+                        driver.execute_script('''
+                            var solution = arguments[0];
+                            if (typeof submitCallback === 'function') {
+                                submitCallback(solution);
+                            } else {
+                                var form = document.getElementById('captcha-form') || document.querySelector('form');
+                                if (form) {
+                                    form.submit();
+                                }
+                            }
+                        ''', captcha_solution)
+                        log_callback("Form submitted successfully!")
+                    except Exception as e:
+                        log_callback(f"Failed to submit form via JS: {e}")
+
+                    time.sleep(5)
                     return captcha_solution
                 elif poll_result.get("request") == "CAPCHA_NOT_READY":
                     log_callback(f"Still waiting... ({i+1}/{max_wait//5})")
@@ -137,7 +161,8 @@ def get_driver():
     import undetected_chromedriver as uc
 
     options = uc.ChromeOptions()
-    options.add_argument("--headless=new")
+    if SCRAPER_HEADLESS:
+        options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
@@ -213,13 +238,21 @@ def get_driver():
 def save_debug(driver, label):
     if not DEBUG_DUMP:
         return
-    path = f"/tmp/debug_{label}_{int(time.time())}.html"
-    with open(path, "w", encoding="utf-8") as f:
+    timestamp = int(time.time())
+    html_path = f"/tmp/debug_{label}_{timestamp}.html"
+    with open(html_path, "w", encoding="utf-8") as f:
         f.write(driver.page_source)
-    print(f"[DEBUG] Page source saved to {path}")
+    print(f"[DEBUG] Page source saved to {html_path}")
+    
+    try:
+        png_path = f"/tmp/debug_{label}_{timestamp}.png"
+        driver.save_screenshot(png_path)
+        print(f"[DEBUG] Screenshot saved to {png_path}")
+    except Exception as e:
+        print(f"[DEBUG] Failed to save screenshot: {e}")
 
 
-def has_product_section(driver):
+def has_product_section(driver, log_callback=None):
     """Check if the page has a product catalog section (not just posts/services)."""
     indicators = [
         "//*[@data-attrid='kc:/local:products_overview_for_desktop']",
@@ -232,9 +265,14 @@ def has_product_section(driver):
         "//*[contains(@class, 'sh-pr')]",
         "//a[contains(@href, '/lpc/')]",
         "//*[@data-product-to-scroll]",
+        "//a[contains(@data-href, '/local/place/products/product')]",
+        "//div[contains(@class, 't3RpAe')]",
     ]
     for xpath in indicators:
-        if driver.find_elements(By.XPATH, xpath):
+        elements = driver.find_elements(By.XPATH, xpath)
+        if elements:
+            if log_callback:
+                log_callback(f"Product section indicator matched: {xpath}")
             return True
 
     # Fallback: look for elements containing "商品" (products) text
@@ -243,11 +281,13 @@ def has_product_section(driver):
         for el in product_text_elements:
             text = el.text.strip()
             if text and len(text) < 50:  # Skip long paragraphs
+                if log_callback:
+                    log_callback(f"Product section fallback text matched: '{text}'")
                 return True
     return False
 
 
-def find_product_show_all(driver):
+def find_product_show_all(driver, log_callback=None):
     """Find 'Show all' button specifically inside a product section."""
     # First look for product-scoped show-all
     product_scope = [
@@ -260,11 +300,15 @@ def find_product_show_all(driver):
         "//*[contains(@data-attrid, 'product')]//*[text()='すべて表示']",
         "//*[contains(@data-attrid, 'product')]//*[contains(text(), 'すべて')]",
         "//div[contains(@class, 'BFOCWc')]/ancestor::*[@data-hveid]//*[contains(text(), 'すべて')]",
+        "//a[contains(text(), 'すべて表示') and ancestor::*[.//a[contains(@data-href, '/local/place/products/product')]]]",
+        "//a[contains(text(), 'すべて表示') and ancestor::*[.//*[contains(@class, 'prDW') or contains(@class, 't3RpAe')]]]",
     ]
     for xpath in product_scope:
         try:
             btn = driver.find_element(By.XPATH, xpath)
             if btn and btn.is_displayed():
+                if log_callback:
+                    log_callback(f"Found 'Show all' button via scoped match: {xpath}")
                 return btn, f"product-section: {xpath[:60]}"
         except Exception:
             continue
@@ -277,11 +321,15 @@ def find_product_show_all(driver):
         ("//*[@aria-label='すべて表示'][contains(@href, 'product')]", "aria-label + product href"),
         ("//a[contains(@href, 'products')][contains(text(), 'すべて')]", "href products + すべて"),
         ("//a[contains(@href, 'lpc')][contains(text(), 'すべて')]", "href lpc + すべて"),
+        ("//a[contains(text(), 'すべて表示')]", "any a tag with すべて表示"),
+        ("//*[contains(text(), 'すべて表示')]", "any element with すべて表示"),
     ]
     for xpath, desc in general:
         try:
             btn = driver.find_element(By.XPATH, xpath)
             if btn and btn.is_displayed():
+                if log_callback:
+                    log_callback(f"Found 'Show all' button via broader match: {desc} ({xpath})")
                 return btn, desc
         except Exception:
             continue
@@ -293,6 +341,7 @@ def handle_local_pack(driver, store_name, log_callback):
     """Check if a local pack is shown, and if so, click the matching business to open its Knowledge Panel."""
     pack_items = driver.find_elements(By.XPATH, "//div[contains(@class, 'dbg0pd')]")
     if not pack_items:
+        log_callback("No local pack found. Treating current page as direct Knowledge Panel...")
         return False
         
     log_callback(f"Local pack detected with {len(pack_items)} items. Looking for matching business...")
@@ -301,32 +350,38 @@ def handle_local_pack(driver, store_name, log_callback):
         try:
             text = item.text.strip()
             if text and store_name in text:
-                log_callback(f"Found matching business in local pack: '{text}'. Clicking to open Knowledge Panel...")
+                log_callback(f"Found matching business in local pack: '{text}'. Preparing to open its Knowledge Panel...")
+                log_callback(f"Scrolling matching business '{text}' into view...")
                 driver.execute_script("arguments[0].scrollIntoView(true);", item)
                 time.sleep(1)
+                
+                log_callback(f"Clicking on business '{text}' in local pack...")
                 driver.execute_script("arguments[0].click();", item)
+                
+                log_callback("Waiting for the Knowledge Panel content to load...")
                 time.sleep(random.uniform(4, 6))
                 
-                # Scroll down to trigger lazy loading of product carousels
+                log_callback("Scrolling page down to trigger lazy loading of product/service catalog carousels...")
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
                 time.sleep(1.5)
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
                 time.sleep(2)
                 
-                # Check if this business has products
-                if has_product_section(driver):
-                    log_callback("Product section found for this business!")
+                log_callback(f"Checking if '{text}' has a Product Catalog section...")
+                if has_product_section(driver, log_callback):
+                    log_callback("Product section successfully found and validated for this business!")
                     return True
                 else:
                     log_callback("No product section found for this business. Trying next match if any...")
-        except Exception:
+        except Exception as e:
+            log_callback(f"Error handling local pack item: {e}")
             continue
             
     log_callback("Finished checking local pack items.")
     return False
 
 
-def extract_product_names(driver):
+def extract_product_names(driver, log_callback=None):
     """Extract product names from the currently visible page/modal."""
     strategies = [
         # Products overview for desktop (current Google structure)
@@ -356,22 +411,30 @@ def extract_product_names(driver):
         # Generic product elements in dialog or carousel
         "//g-scrolling-carousel//span[string-length(normalize-space())>1]",
         "//div[@role='dialog']//span[string-length(normalize-space())>1]",
+        # Direct product classes based on observation
+        "//div[contains(@class, 't3RpAe')]",
+        "//a[contains(@data-href, '/local/place/products/product')]//div[contains(@class, 't3RpAe')]",
+        "//div[contains(@class, 'su7Prc')]//div[contains(@class, 't3RpAe')]",
     ]
     seen = set()
     for selector in strategies:
         items = driver.find_elements(By.XPATH, selector)
+        if items and log_callback:
+            log_callback(f"Checking xpath strategy '{selector}' - found {len(items)} elements...")
         for item in items:
             text = item.text.strip()
             if text:
                 text = text.split('\n')[0].strip()
             if text and text not in seen:
                 seen.add(text)
+                if log_callback:
+                    log_callback(f"Successfully extracted product name: '{text}'")
         if seen:
             return list(seen)
     return []
 
 
-def extract_service_names(driver):
+def extract_service_names(driver, log_callback=None):
     """Extract service/category names for service businesses."""
     strategies = [
         "//div[contains(@class, 'sB1Bee')]",
@@ -383,10 +446,14 @@ def extract_service_names(driver):
     seen = set()
     for selector in strategies:
         items = driver.find_elements(By.XPATH, selector)
+        if items and log_callback:
+            log_callback(f"Checking service catalog strategy '{selector}' - found {len(items)} elements...")
         for item in items:
             text = item.text.strip()
             if text and text not in seen:
                 seen.add(text)
+                if log_callback:
+                    log_callback(f"Successfully extracted fallback service name: '{text}'")
         if seen:
             return list(seen)
     return []
@@ -437,24 +504,27 @@ def _scrape_attempt(store_name: str, log_callback) -> tuple[dict, object]:
                 log_callback("Attempting to solve reCAPTCHA with 2Captcha...")
                 token = solve_recaptcha(driver, log_callback)
                 if token:
-                    log_callback("reCAPTCHA solved! Navigating to fresh URL...")
-                    time.sleep(2)
-
-                    # Navigate to a fresh URL instead of just refreshing
-                    # This helps clear any cached session issues
-                    encoded_query = urllib.parse.quote(store_name)
-                    new_url = f"https://www.google.co.jp/search?q={encoded_query}&hl=ja&gl=jp&tbs=isz:l"
-                    driver.get(new_url)
-                    time.sleep(random.uniform(4, 7))
+                    log_callback("reCAPTCHA solved! Checking if redirect occurred...")
+                    time.sleep(3)
 
                     # Check if page loaded successfully after solve
                     new_page_source = driver.page_source.lower()
                     if "recaptcha" not in new_page_source and "unusual traffic" not in new_page_source:
-                        log_callback("reCAPTCHA bypassed successfully!")
+                        log_callback("reCAPTCHA bypassed successfully via form redirect!")
                         result.pop("_recaptcha", None)
-                        # Continue with scraping
                     else:
-                        log_callback("reCAPTCHA still present after solve - trying to find and click submit if exists")
+                        log_callback("Still on reCAPTCHA page, navigating to search URL manually...")
+                        encoded_query = urllib.parse.quote(store_name)
+                        new_url = f"https://www.google.co.jp/search?q={encoded_query}&hl=ja&gl=jp&tbs=isz:l"
+                        driver.get(new_url)
+                        time.sleep(random.uniform(4, 7))
+
+                        new_page_source = driver.page_source.lower()
+                        if "recaptcha" not in new_page_source and "unusual traffic" not in new_page_source:
+                            log_callback("reCAPTCHA bypassed successfully after manual navigation!")
+                            result.pop("_recaptcha", None)
+                        else:
+                            log_callback("reCAPTCHA still present after manual navigation - trying to find and click submit if exists")
 
                         # Try to find and click any submit button in the form
                         try:
@@ -492,19 +562,19 @@ def _scrape_attempt(store_name: str, log_callback) -> tuple[dict, object]:
         # Handle local pack if it exists (multiple businesses listed)
         handle_local_pack(driver, store_name, log_callback)
 
-        has_products = has_product_section(driver)
-        log_callback(f"Product section detected: {has_products}")
+        has_products = has_product_section(driver, log_callback)
+        log_callback(f"Product section final detection result: {has_products}")
 
         if has_products:
             log_callback("Looking for 'Show all' button in product section...")
-            show_all_btn, strategy_desc = find_product_show_all(driver)
+            show_all_btn, strategy_desc = find_product_show_all(driver, log_callback)
 
             log_callback("Extracting product names before clicking 'Show all'...")
-            products_before = extract_product_names(driver)
+            products_before = extract_product_names(driver, log_callback)
 
             if show_all_btn:
                 log_callback(f"Found 'Show all' button via: {strategy_desc}")
-                log_callback("Clicking 'Show all' button...")
+                log_callback("Scrolling to 'Show all' button...")
 
                 # Human-like: random delay before clicking
                 time.sleep(random.uniform(0.5, 1.5))
@@ -513,19 +583,25 @@ def _scrape_attempt(store_name: str, log_callback) -> tuple[dict, object]:
                 driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", show_all_btn)
                 time.sleep(random.uniform(0.3, 0.8))
 
+                log_callback("Clicking the 'Show all' button...")
                 try:
                     show_all_btn.click()
-                except Exception:
+                    log_callback("Native element click successful.")
+                except Exception as e:
+                    log_callback(f"Native click failed ({e}). Falling back to JavaScript click...")
                     driver.execute_script("arguments[0].click();", show_all_btn)
+                    log_callback("JavaScript click executed.")
 
-                log_callback("Waiting for product modal/section to load...")
+                log_callback("Waiting for product modal/section to load dynamically...")
                 time.sleep(random.uniform(3, 5))
                 save_debug(driver, "after_showall_click")
 
             log_callback("Extracting product names after clicking 'Show all'...")
-            products_after = extract_product_names(driver)
+            products_after = extract_product_names(driver, log_callback)
 
             all_products = list(set(products_before + products_after))
+            if all_products:
+                log_callback(f"Extracted product names list: {all_products}")
 
             if all_products:
                 result["products"] = all_products
@@ -537,7 +613,7 @@ def _scrape_attempt(store_name: str, log_callback) -> tuple[dict, object]:
             log_callback("No products extracted — checking for services fallback...")
 
         log_callback("Checking for service/category names as fallback...")
-        services = extract_service_names(driver)
+        services = extract_service_names(driver, log_callback)
 
         if services:
             result["products"] = services
