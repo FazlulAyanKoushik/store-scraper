@@ -488,14 +488,53 @@ def handle_local_pack(driver, store_name, log_callback):
     return False
 
 
+def scroll_knowledge_panel(driver):
+    """Scroll the Knowledge Panel and any scrollable containers to trigger lazy loading."""
+    # Main window scroll
+    for pos in range(0, 3000, 300):
+        driver.execute_script(f"window.scrollTo(0, {pos});")
+        time.sleep(0.3)
+    
+    # Try scrolling any scrollable containers inside the page
+    driver.execute_script("""
+        document.querySelectorAll('div[style*="overflow"], div[class*="scroll"]').forEach(function(el) {
+            if (el.scrollHeight > el.clientHeight) {
+                el.scrollTop = el.scrollHeight;
+            }
+        });
+    """)
+    time.sleep(1)
+
+
+def count_category_products(driver, log_callback=None):
+    """Count total products from categorized view without needing product names."""
+    categories = driver.find_elements(By.XPATH, "//div[contains(@class, 'f8twAd')]")
+    if not categories:
+        return 0, {}
+    
+    total = 0
+    cat_counts = {}
+    for cat in categories:
+        try:
+            cat_name_el = cat.find_elements(By.XPATH, ".//div[contains(@class, 'EJHGm')]")
+            cat_name = cat_name_el[0].text.strip() if cat_name_el else "unknown"
+            products = cat.find_elements(By.XPATH, ".//div[contains(@class, 'J8zyUd')]")
+            count = len(products)
+            total += count
+            cat_counts[cat_name] = count
+            if log_callback:
+                log_callback(f"  Category '{cat_name}': {count} products")
+        except:
+            pass
+    return total, cat_counts
+
+
 def extract_product_names(driver, log_callback=None):
     """Extract product names from the currently visible page/modal."""
-    # Filter out button text and headers - these are not products
     excluded_texts = {
         "すべて表示", "すべて", "商品", "サービス", "products", "services", 
         "Show all", "Show more", "もっと見る", "商品情報", "メニュー", "Product Info",
         "カテゴリを探索", "カテゴリ", "カテゴリを表示", "サービスを表示", "工事メニュー",
-        # Known category headers observed in captures
         "施工・工事", "調査", "ご相談"
     }
     
@@ -505,12 +544,8 @@ def extract_product_names(driver, log_callback=None):
     def add_if_valid(text, source_label=""):
         if not text:
             return
-        # Clean text
         text = text.split('\n')[0].strip()
-        # Some items might have prices or other info in sub-elements if we select a container
-        # but text.split('\n')[0] usually gets the title.
         if text and text not in excluded_texts and text not in seen:
-            # Avoid single words that look like labels unless they are likely products
             if len(text) < 2:
                 return
             seen.add(text)
@@ -521,8 +556,22 @@ def extract_product_names(driver, log_callback=None):
     if log_callback:
         log_callback("[DEBUG] Looking for product modal elements...")
     
-    # Priority 1: Specific modal classes identified in category_wise_div.html
-    # Check for categories first (f8twAd)
+    # Priority 1: Carousel products in products_overview section (always visible)
+    carousel_items = driver.find_elements(By.XPATH, "//div[@data-attrid='kc:/local:products_overview_for_desktop']//div[contains(@class, 'Gik6Zd')]")
+    if carousel_items:
+        if log_callback:
+            log_callback(f"[DEBUG] Found {len(carousel_items)} carousel product items")
+        for item in carousel_items:
+            try:
+                add_if_valid(item.text, "carousel")
+            except:
+                pass
+        if product_names:
+            if log_callback:
+                log_callback(f"[DEBUG] Extracted {len(product_names)} products from carousel.")
+            return product_names
+
+    # Priority 2: Categorized view (f8twAd > J8zyUd > t3RpAe) — lazy-loaded, may not exist
     categories = driver.find_elements(By.XPATH, "//div[contains(@class, 'f8twAd')]")
     if categories:
         if log_callback:
@@ -530,13 +579,11 @@ def extract_product_names(driver, log_callback=None):
         
         for cat_index, cat in enumerate(categories):
             try:
-                # Try to get category name for logging
                 cat_name_el = cat.find_elements(By.XPATH, ".//div[contains(@class, 'EJHGm')]")
                 cat_name = cat_name_el[0].text.strip() if cat_name_el else f"Category {cat_index}"
                 if log_callback:
                     log_callback(f"[DEBUG] Processing category: {cat_name}")
 
-                # Handle "Show more" (もっと見る) within the category
                 try:
                     show_more_btns = cat.find_elements(By.XPATH, ".//*[contains(text(), 'もっと見る')]")
                     for btn in show_more_btns:
@@ -549,12 +596,8 @@ def extract_product_names(driver, log_callback=None):
                     if log_callback:
                         log_callback(f"[DEBUG] Error clicking 'Show more' in {cat_name}: {e}")
 
-                # Extract products within this category
-                # Structure: f8twAd > ... > J8zyUd > a.pooVf > div.su7Prc > div.t3RpAe
                 product_elements = cat.find_elements(By.XPATH, ".//div[contains(@class, 'J8zyUd')]//div[contains(@class, 't3RpAe')]")
-                
                 if not product_elements:
-                    # Fallback to any text inside J8zyUd
                     product_elements = cat.find_elements(By.XPATH, ".//div[contains(@class, 'J8zyUd')]")
                 
                 if log_callback:
@@ -572,7 +615,7 @@ def extract_product_names(driver, log_callback=None):
                 log_callback(f"[DEBUG] Successfully extracted {len(product_names)} products from categories.")
             return product_names
 
-    # If no categories found, or no products in categories, fall back to global selectors
+    # Priority 3: Global product selectors
     selectors = [
         "//div[contains(@class, 'su7Prc')]//div[contains(@class, 't3RpAe')]",
         "//a[contains(@class, 'pooVf')]//div[contains(@class, 't3RpAe')]",
@@ -596,7 +639,7 @@ def extract_product_names(driver, log_callback=None):
             if product_names:
                 return product_names
 
-    # Priority 2: Knowledge Panel / Desktop Overview
+    # Priority 3: Knowledge Panel selectors
     kp_selectors = [
         "//*[@data-attrid='kc:/local:products_overview_for_desktop']//span[contains(@class, 'OSrXXb')]",
         "//*[@data-attrid='kc:/local:product catalog']//span",
@@ -778,20 +821,48 @@ def _scrape_attempt(store_name: str, log_callback) -> tuple[dict, object]:
         log_callback(f"Product section final detection result: {has_products}")
 
         if has_products:
-            log_callback("Looking for 'Show all' button in product section...")
-            show_all_btn, strategy_desc = find_product_show_all(driver, log_callback)
+            # Scroll aggressively to trigger lazy-loaded categorized view
+            log_callback("Scrolling to trigger lazy-loaded product categories...")
+            scroll_knowledge_panel(driver)
 
-            log_callback("Extracting product names before clicking 'Show all'...")
+            # First, try to extract from categorized view without clicking "Show all"
+            log_callback("Checking for categorized product view (f8twAd)...")
+            categories = driver.find_elements(By.XPATH, "//div[contains(@class, 'f8twAd')]")
+            if categories:
+                log_callback(f"Found {len(categories)} categories. Extracting products directly...")
+                products = extract_product_names(driver, log_callback)
+                if products:
+                    result["products"] = products
+                    result["product_count"] = len(products)
+                    log_callback(f"Done. Product count: {result['product_count']}")
+                    return result, driver
+
+                # If names failed, at least count products from J8zyUd elements
+                total_count, cat_counts = count_category_products(driver, log_callback)
+                if total_count > 0:
+                    result["products"] = []
+                    result["product_count"] = total_count
+                    log_callback(f"Done. Total product count across categories: {total_count}")
+                    return result, driver
+
+            log_callback("Extracting product names from carousel/visible view...")
             products_before = extract_product_names(driver, log_callback)
+
+            if products_before:
+                result["products"] = products_before
+                result["product_count"] = len(products_before)
+                log_callback(f"Done. Product count: {result['product_count']}")
+                return result, driver
+
+            log_callback("No products in carousel. Looking for 'Show all' button...")
+            show_all_btn, strategy_desc = find_product_show_all(driver, log_callback)
 
             if show_all_btn:
                 log_callback(f"Found 'Show all' button via: {strategy_desc}")
                 log_callback("Scrolling to 'Show all' button...")
 
-                # Human-like: random delay before clicking
                 time.sleep(random.uniform(0.5, 1.5))
 
-                # Scroll to the button first
                 driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", show_all_btn)
                 time.sleep(random.uniform(0.3, 0.8))
 
@@ -807,29 +878,22 @@ def _scrape_attempt(store_name: str, log_callback) -> tuple[dict, object]:
                 log_callback("Waiting for product modal/section to load dynamically...")
                 time.sleep(random.uniform(4, 6))
                 
-                # Force scroll to make modal visible and trigger render
                 driver.execute_script("window.scrollTo(0, 200);")
                 time.sleep(1)
-                
-                # Additional wait for modal content to fully render
                 driver.execute_script("window.scrollTo(0, 400);")
                 time.sleep(2)
                 
-                # Debug: log page source length to check if modal is loaded
                 page_html = driver.page_source
                 log_callback(f"DEBUG: Page HTML length: {len(page_html)} chars")
                 
-                # Check for modal indicators
                 has_zpm4jb = "ZPm4jb" in page_html
                 has_su7prc = "su7Prc" in page_html
                 log_callback(f"DEBUG: Has ZPm4jb in page: {has_zpm4jb}")
                 log_callback(f"DEBUG: Has su7Prc in page: {has_su7prc}")
                 
-                # Scroll to make dialog visible in viewport
                 driver.execute_script("window.scrollTo(0, 300);")
                 time.sleep(1)
                 
-                # Wait for dialog/modal to appear
                 try:
                     WebDriverWait(driver, 5).until(
                         EC.presence_of_element_located((By.XPATH, "//div[@role='dialog']"))
@@ -843,7 +907,7 @@ def _scrape_attempt(store_name: str, log_callback) -> tuple[dict, object]:
             log_callback("Extracting product names after clicking 'Show all'...")
             products_after = extract_product_names(driver, log_callback)
 
-            all_products = list(set(products_before + products_after))
+            all_products = list(set(products_after))
             if all_products:
                 log_callback(f"Extracted product names list: {all_products}")
 
@@ -851,22 +915,22 @@ def _scrape_attempt(store_name: str, log_callback) -> tuple[dict, object]:
                 result["products"] = all_products
                 result["product_count"] = len(all_products)
                 log_callback(f"Done. Product count: {result['product_count']}")
-                
-                # Check if this was likely categorized
-                has_categories = "f8twAd" in driver.page_source
-                if has_categories:
-                    log_callback(f"[DEBUG] Extracted {len(all_products)} products from a categorized view.")
-                
                 return result, driver
 
-            # Debug: save page source when no products found
+            # After "Show all", also try counting J8zyUd
+            total_count, cat_counts = count_category_products(driver, log_callback)
+            if total_count > 0:
+                result["products"] = []
+                result["product_count"] = total_count
+                log_callback(f"Done. Total product count across categories: {total_count}")
+                return result, driver
+
             log_callback("DEBUG: No products extracted. Saving page for analysis...")
             save_debug(driver, "no_products_found")
             
-            # Also try to get all elements with t3RpAe class anywhere on page
             all_t3rpae = driver.find_elements(By.XPATH, "//*[contains(@class, 't3RpAe')]")
             log_callback(f"DEBUG: Found {len(all_t3rpae)} elements with class 't3RpAe' anywhere on page")
-            for i, el in enumerate(all_t3rpae[:5]):  # Show first 5
+            for i, el in enumerate(all_t3rpae[:5]):
                 log_callback(f"  DEBUG t3RpAe[{i}]: '{el.text.strip()}'")
             log_callback("No products extracted — checking for services fallback...")
 

@@ -1,3 +1,5 @@
+# tasks.py - Celery task for scraping store products and logging progress to Redis
+
 import json
 import os
 import redis
