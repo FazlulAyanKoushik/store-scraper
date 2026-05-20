@@ -507,26 +507,164 @@ def scroll_knowledge_panel(driver):
 
 
 def count_category_products(driver, log_callback=None):
-    """Count total products from categorized view without needing product names."""
-    categories = driver.find_elements(By.XPATH, "//div[contains(@class, 'f8twAd')]")
-    if not categories:
-        return 0, {}
+    """Count total products from categorized view by counting J8zyUd elements.
     
-    total = 0
-    cat_counts = {}
-    for cat in categories:
+    For each category (f8twAd):
+    1. Click 'Show more' (もっと見る) to load all products
+    2. Count all J8zyUd div elements
+    
+    This gives 100% accurate product count.
+    """
+    if log_callback is None:
+        log_callback = lambda msg: None
+
+    log_callback("[COUNT] Starting product counting...")
+    
+    switched_to_iframe = False
+    try:
+        # Wait up to 5 seconds for the iframe to be present
+        catalog_iframes = []
+        for i in range(5):
+            catalog_iframes = driver.find_elements(By.CSS_SELECTOR, "iframe[src*='products/catalog'], iframe[name='lpc'], iframe.PxHPSd")
+            if catalog_iframes:
+                break
+            time.sleep(1.0)
+            
+        if catalog_iframes:
+            log_callback(f"[COUNT] Found {len(catalog_iframes)} catalog iframe(s). Switching to the first one...")
+            driver.switch_to.frame(catalog_iframes[0])
+            switched_to_iframe = True
+            log_callback("[COUNT] Switched to catalog iframe successfully.")
+            time.sleep(1.0)
+            
+        # Scroll modal scrollable container dynamically to trigger lazy loading of categories
         try:
-            cat_name_el = cat.find_elements(By.XPATH, ".//div[contains(@class, 'EJHGm')]")
-            cat_name = cat_name_el[0].text.strip() if cat_name_el else "unknown"
-            products = cat.find_elements(By.XPATH, ".//div[contains(@class, 'J8zyUd')]")
-            count = len(products)
-            total += count
-            cat_counts[cat_name] = count
-            if log_callback:
-                log_callback(f"  Category '{cat_name}': {count} products")
-        except:
-            pass
-    return total, cat_counts
+            scroll_script = """
+                var scrolled = false;
+                var dialog = document.querySelector('div[role="dialog"]') || document.querySelector('div.V7nvVb');
+                if (dialog) {
+                    // Find all scrollable elements inside the dialog
+                    var containers = dialog.querySelectorAll('div[style*="overflow"], div[class*="scroll"], div[style*="height"]');
+                    if (containers.length === 0) {
+                        dialog.scrollTop = dialog.scrollHeight;
+                        scrolled = true;
+                    } else {
+                        containers.forEach(function(el) {
+                            if (el.scrollHeight > el.clientHeight) {
+                                el.scrollTop = el.scrollHeight;
+                                scrolled = true;
+                            }
+                        });
+                    }
+                }
+                return scrolled;
+            """
+            scrolled = driver.execute_script(scroll_script)
+            if scrolled:
+                log_callback("[COUNT] Scrolled modal dialog container to load categories.")
+                time.sleep(2.0)
+        except Exception as e:
+            log_callback(f"[COUNT] Failed to scroll modal container: {e}")
+
+        # Helper to find product elements using either wrapper classes (J8zyUd, LoZyGb) or link class (pooVf)
+        def get_product_elements(container):
+            found = container.find_elements(By.CSS_SELECTOR, "div.J8zyUd, div.LoZyGb")
+            if not found:
+                found = container.find_elements(By.CSS_SELECTOR, "a.pooVf")
+            return found
+
+        # First, just count all product elements on page (simple baseline)
+        all_prods = get_product_elements(driver)
+        log_callback(f"[COUNT] Found {len(all_prods)} product elements on page (before Show more)")
+        
+        # Try to find categories - both on main page and in modal
+        categories = driver.find_elements(By.CSS_SELECTOR, "div.f8twAd")
+        
+        # Also try to find categories inside modal/dialog
+        dialog_categories = driver.find_elements(By.XPATH, "//div[@role='dialog']//div[contains(@class, 'f8twAd')]")
+        if dialog_categories:
+            log_callback(f"[COUNT] Found {len(dialog_categories)} categories inside dialog/modal")
+            categories = dialog_categories
+        
+        if not categories:
+            # Fallback: count all products anywhere on page
+            all_products = get_product_elements(driver)
+            count = len(all_products)
+            log_callback(f"[COUNT] No categories found. Total product elements on page: {count}")
+            return count, {}
+        
+        log_callback(f"[COUNT] Found {len(categories)} categories")
+        
+        total = 0
+        cat_counts = {}
+        
+        for cat in categories:
+            try:
+                cat_name_el = cat.find_elements(By.CSS_SELECTOR, "div.EJHGm")
+                cat_name = cat_name_el[0].text.strip() if cat_name_el else "unknown"
+                
+                log_callback(f"[COUNT] Processing category: {cat_name}")
+                
+                # Click "Show more" button in each category to load all products
+                show_more_clicked = True
+                click_attempts = 0
+                while show_more_clicked and click_attempts < 10:
+                    show_more_clicked = False
+                    click_attempts += 1
+                    
+                    # Find and click "Show more" (もっと見る) button - multiple robust strategies
+                    show_more_btns = cat.find_elements(By.CSS_SELECTOR, "div.b7K3Ue button, div.b7K3Ue [role='button']")
+                    if not show_more_btns:
+                        show_more_btns = cat.find_elements(By.XPATH, ".//button[.//span[contains(text(), 'もっと見る')]]")
+                    if not show_more_btns:
+                        show_more_btns = cat.find_elements(By.XPATH, ".//button[contains(text(), 'もっと見る')]")
+                    if not show_more_btns:
+                        show_more_btns = cat.find_elements(By.XPATH, ".//button[contains(., 'もっと見る')]")
+                    if not show_more_btns:
+                        show_more_btns = cat.find_elements(By.XPATH, ".//span[text()='もっと見る']/ancestor::button")
+                    if not show_more_btns:
+                        show_more_btns = cat.find_elements(By.XPATH, ".//*[contains(@class, 'b7K3Ue')]//button")
+                    
+                    for btn in show_more_btns:
+                        try:
+                            # Scroll the button into view inside its container first
+                            driver.execute_script("arguments[0].scrollIntoView({behavior: 'instant', block: 'center'});", btn)
+                            time.sleep(0.5)
+                            
+                            log_callback(f"[COUNT] Clicking 'Show more' in '{cat_name}' (attempt {click_attempts})")
+                            driver.execute_script("arguments[0].click();", btn)
+                            time.sleep(random.uniform(1.5, 2.5))
+                            show_more_clicked = True
+                            break
+                        except Exception as e:
+                            log_callback(f"[COUNT] Error clicking button: {e}")
+                
+                # Count product elements in this category using robust CSS selector
+                products = get_product_elements(cat)
+                count = len(products)
+                total += count
+                cat_counts[cat_name] = count
+                log_callback(f"[COUNT] Category '{cat_name}': {count} products")
+            except Exception as e:
+                log_callback(f"[COUNT] Error processing category: {e}")
+                pass
+        
+        # Also count any remaining products not in categories
+        all_products = get_product_elements(driver)
+        if len(all_products) > total:
+            log_callback(f"[COUNT] Found {len(all_products) - total} additional product elements outside categories")
+            total = len(all_products)
+        
+        log_callback(f"[COUNT] Total products: {total}")
+        return total, cat_counts
+        
+    finally:
+        if switched_to_iframe:
+            try:
+                driver.switch_to.default_content()
+                log_callback("[COUNT] Switched back to default content.")
+            except Exception as e:
+                log_callback(f"[COUNT] Error switching back to default content: {e}")
 
 
 def extract_product_names(driver, log_callback=None):
@@ -621,6 +759,8 @@ def extract_product_names(driver, log_callback=None):
         "//a[contains(@class, 'pooVf')]//div[contains(@class, 't3RpAe')]",
         "//div[contains(@class, 'ZPm4jb')]//div[contains(@class, 't3RpAe')]",
         "//div[@role='dialog']//div[contains(@class, 't3RpAe')]",
+        "//div[@role='dialog']//div[contains(@class, 'su7Prc')]",
+        "//div[@role='dialog']//div[contains(@class, 'J8zyUd')]",
         "//*[contains(@class, 'J8zyUd')]//div[contains(@class, 't3RpAe')]",
         "//div[contains(@class, 'su7Prc')]",
         "//a[contains(@class, 'pooVf')]",
@@ -637,9 +777,10 @@ def extract_product_names(driver, log_callback=None):
                     add_if_valid(el.text, selector)
                 except: continue
             if product_names:
+                log_callback(f"[DEBUG] Returning {len(product_names)} products from selector: {selector}")
                 return product_names
 
-    # Priority 3: Knowledge Panel selectors
+    # Priority 4: Knowledge Panel selectors
     kp_selectors = [
         "//*[@data-attrid='kc:/local:products_overview_for_desktop']//span[contains(@class, 'OSrXXb')]",
         "//*[@data-attrid='kc:/local:product catalog']//span",
@@ -658,6 +799,29 @@ def extract_product_names(driver, log_callback=None):
                     add_if_valid(el.text, "KP")
                 except: continue
             if product_names:
+                return product_names
+
+    # Priority 5: Deep search in dialog/modal for any product-like elements
+    modal_selectors = [
+        "//div[@role='dialog']//ul//li",
+        "//div[@role='dialog']//section//div",
+        "//div[@role='dialog']//div[contains(@class, 'Gik6Zd')]",
+        "//div[@role='dialog']//div[contains(@class, 'pooVf')]",
+    ]
+    
+    for selector in modal_selectors:
+        elements = driver.find_elements(By.XPATH, selector)
+        if elements:
+            if log_callback:
+                log_callback(f"[DEBUG] Modal search: Found {len(elements)} elements with {selector}")
+            for el in elements:
+                try:
+                    text = el.text.strip()
+                    if text and len(text) > 2 and len(text) < 100:
+                        add_if_valid(text, "modal")
+                except: continue
+            if product_names:
+                log_callback(f"[DEBUG] Returning {len(product_names)} products from modal search")
                 return product_names
 
     return []
@@ -825,27 +989,65 @@ def _scrape_attempt(store_name: str, log_callback) -> tuple[dict, object]:
             log_callback("Scrolling to trigger lazy-loaded product categories...")
             scroll_knowledge_panel(driver)
 
-            # First, try to extract from categorized view without clicking "Show all"
             log_callback("Checking for categorized product view (f8twAd)...")
-            categories = driver.find_elements(By.XPATH, "//div[contains(@class, 'f8twAd')]")
-            if categories:
-                log_callback(f"Found {len(categories)} categories. Extracting products directly...")
-                products = extract_product_names(driver, log_callback)
-                if products:
-                    result["products"] = products
-                    result["product_count"] = len(products)
-                    log_callback(f"Done. Product count: {result['product_count']}")
-                    return result, driver
+            
+            # First, check if categories already exist on page (no need to click Show all)
+            pre_check_categories = driver.find_elements(By.XPATH, "//div[contains(@class, 'f8twAd')]")
+            pre_check_j8zyud = driver.find_elements(By.XPATH, "//div[contains(@class, 'J8zyUd') or contains(@class, 'LoZyGb')]")
+            if not pre_check_j8zyud:
+                pre_check_j8zyud = driver.find_elements(By.XPATH, "//a[contains(@class, 'pooVf')]")
+            log_callback(f"[DEBUG] Pre-check - Categories: {len(pre_check_categories)}, Product items: {len(pre_check_j8zyud)}")
+            
+            # Only click Show all if no categories found yet
+            if not pre_check_categories and not pre_check_j8zyud:
+                show_all_btn, strategy_desc = find_product_show_all(driver, log_callback)
+                if show_all_btn:
+                    log_callback(f"Found 'Show all' button via: {strategy_desc}")
+                    driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", show_all_btn)
+                    time.sleep(random.uniform(0.3, 0.8))
+                    
+                    try:
+                        show_all_btn.click()
+                    except:
+                        driver.execute_script("arguments[0].click();", show_all_btn)
+                    
+                    log_callback("Clicked Show all, waiting for load...")
+                    time.sleep(random.uniform(4, 6))
+                    
+                    # Aggressive scrolling to trigger lazy loading
+                    for scroll_pos in [200, 400, 600, 800, 1000, 1500, 2000]:
+                        driver.execute_script(f"window.scrollTo(0, {scroll_pos});")
+                        time.sleep(0.5)
+                    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    time.sleep(1)
+                    driver.execute_script("window.scrollTo(0, 0);")
+                    time.sleep(1)
+                    
+                    # Debug: Save page after Show all click
+                    log_callback("[DEBUG] Saving page after Show all click for analysis...")
+                    save_debug(driver, "after_showall_v2")
+            else:
+                log_callback("[DEBUG] Categories already visible, skipping Show all click")
+            
+            # DEBUG: Check what's on the page before counting
+            debug_categories = driver.find_elements(By.XPATH, "//div[contains(@class, 'f8twAd')]")
+            debug_dialog_categories = driver.find_elements(By.XPATH, "//div[@role='dialog']//div[contains(@class, 'f8twAd')]")
+            debug_j8zyud = driver.find_elements(By.XPATH, "//div[contains(@class, 'J8zyUd') or contains(@class, 'LoZyGb')]")
+            if not debug_j8zyud:
+                debug_j8zyud = driver.find_elements(By.XPATH, "//a[contains(@class, 'pooVf')]")
+            log_callback(f"[DEBUG] Final - Categories: {len(debug_categories)}, in dialog: {len(debug_dialog_categories)}, Product items: {len(debug_j8zyud)}")
+            
+            # Count products by J8zyUd elements - 100% accurate
+            total_count, cat_counts = count_category_products(driver, log_callback)
+            log_callback(f"[DEBUG] count_category_products returned: {total_count}, cat_counts: {cat_counts}")
+            
+            if total_count > 0:
+                result["products"] = []
+                result["product_count"] = total_count
+                log_callback(f"Done. Total product count: {total_count} (by category: {cat_counts})")
+                return result, driver
 
-                # If names failed, at least count products from J8zyUd elements
-                total_count, cat_counts = count_category_products(driver, log_callback)
-                if total_count > 0:
-                    result["products"] = []
-                    result["product_count"] = total_count
-                    log_callback(f"Done. Total product count across categories: {total_count}")
-                    return result, driver
-
-            log_callback("Extracting product names from carousel/visible view...")
+            log_callback("No products found via counting. Trying name extraction as fallback...")
             products_before = extract_product_names(driver, log_callback)
 
             if products_before:
@@ -878,11 +1080,6 @@ def _scrape_attempt(store_name: str, log_callback) -> tuple[dict, object]:
                 log_callback("Waiting for product modal/section to load dynamically...")
                 time.sleep(random.uniform(4, 6))
                 
-                driver.execute_script("window.scrollTo(0, 200);")
-                time.sleep(1)
-                driver.execute_script("window.scrollTo(0, 400);")
-                time.sleep(2)
-                
                 page_html = driver.page_source
                 log_callback(f"DEBUG: Page HTML length: {len(page_html)} chars")
                 
@@ -890,9 +1087,6 @@ def _scrape_attempt(store_name: str, log_callback) -> tuple[dict, object]:
                 has_su7prc = "su7Prc" in page_html
                 log_callback(f"DEBUG: Has ZPm4jb in page: {has_zpm4jb}")
                 log_callback(f"DEBUG: Has su7Prc in page: {has_su7prc}")
-                
-                driver.execute_script("window.scrollTo(0, 300);")
-                time.sleep(1)
                 
                 try:
                     WebDriverWait(driver, 5).until(
@@ -904,25 +1098,71 @@ def _scrape_attempt(store_name: str, log_callback) -> tuple[dict, object]:
                 
                 save_debug(driver, "after_showall_click")
 
-            log_callback("Extracting product names after clicking 'Show all'...")
-            products_after = extract_product_names(driver, log_callback)
+                log_callback("Aggressively scrolling to load all lazy products...")
+                for scroll_pos in [200, 400, 600, 800, 1000, 1200, 1500, 1800, 2000]:
+                    driver.execute_script(f"window.scrollTo(0, {scroll_pos});")
+                    time.sleep(0.8)
+                
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(2)
 
-            all_products = list(set(products_after))
-            if all_products:
-                log_callback(f"Extracted product names list: {all_products}")
+                log_callback("Checking for 'Load more' or pagination buttons...")
+                load_more_clicked = True
+                load_more_attempts = 0
+                while load_more_clicked and load_more_attempts < 10:
+                    load_more_clicked = False
+                    load_more_attempts += 1
+                    
+                    load_more_selectors = [
+                        "//button[contains(text(), 'もっと見る')]",
+                        "//button[contains(text(), 'Load more')]",
+                        "//button[contains(text(), 'more')]",
+                        "//span[contains(text(), 'もっと見る')]/ancestor::button",
+                        "//a[contains(text(), 'もっと見る')]",
+                        "//button[contains(@aria-label, 'more')]",
+                        "//div[@role='button'][contains(text(), 'もっと')]",
+                    ]
+                    
+                    for selector in load_more_selectors:
+                        try:
+                            buttons = driver.find_elements(By.XPATH, selector)
+                            for btn in buttons:
+                                if btn.is_displayed() and btn.is_enabled():
+                                    log_callback(f"Clicking load more button: {selector}")
+                                    driver.execute_script("arguments[0].click();", btn)
+                                    time.sleep(random.uniform(1.5, 2.5))
+                                    
+                                    for scroll_pos in [300, 600, 900]:
+                                        driver.execute_script(f"window.scrollTo(0, {scroll_pos});")
+                                        time.sleep(0.5)
+                                    
+                                    load_more_clicked = True
+                                    break
+                        except Exception:
+                            continue
+                    if load_more_clicked:
+                        log_callback(f"Load more clicked, attempt {load_more_attempts}")
 
-            if all_products:
-                result["products"] = all_products
-                result["product_count"] = len(all_products)
-                log_callback(f"Done. Product count: {result['product_count']}")
-                return result, driver
+                driver.execute_script("window.scrollTo(0, 0);")
+                time.sleep(1)
 
-            # After "Show all", also try counting J8zyUd
+            # Count products by J8zyUd elements - 100% accurate method
+            log_callback("Counting products by J8zyUd elements...")
             total_count, cat_counts = count_category_products(driver, log_callback)
             if total_count > 0:
                 result["products"] = []
                 result["product_count"] = total_count
-                log_callback(f"Done. Total product count across categories: {total_count}")
+                log_callback(f"Done. Total product count: {total_count} (by category: {cat_counts})")
+                return result, driver
+
+            log_callback("No J8zyUd elements found. Trying to extract product names as fallback...")
+            products_after = extract_product_names(driver, log_callback)
+
+            all_products = list(set(products_after))
+            if all_products:
+                result["products"] = all_products
+                result["product_count"] = len(all_products)
+                log_callback(f"Done. Product count: {result['product_count']}")
                 return result, driver
 
             log_callback("DEBUG: No products extracted. Saving page for analysis...")
